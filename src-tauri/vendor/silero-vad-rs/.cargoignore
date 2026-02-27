@@ -1,0 +1,45 @@
+# Python related files
+python/
+*.py
+*.ipynb
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.ipynb_checkpoints
+
+# Development files
+.github/
+.git/
+.gitignore
+.cargoignore
+.editorconfig
+.vscode/
+.idea/
+*.md
+!README.md
+!LICENSE
+
+# Build artifacts
+target/
+debug/
+release/
+
+# Test files
+tests/
+examples/
+
+# Model files
+*.onnx
+models/
+
+# Documentation
+docs/ 

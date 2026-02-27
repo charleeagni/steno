@@ -1,0 +1,25 @@
+[package]
+name = "silero-vad-rs"
+version = "0.1.2"
+edition = "2021"
+description = "Rust implementation of Silero Voice Activity Detection"
+license = "MIT"
+repository = "https://github.com/binarycrayon/silero-vad-rs"
+
+[dependencies]
+ort = { version = "=2.0.0-rc.9", features = ["ndarray", "cuda", "fetch-models"] }  # ONNX Runtime binding for Rust
+ndarray = "0.15.6"     # For numerical computations
+ndarray-stats = "0.5.1" # For statistical operations
+anyhow = "1.0.75"      # For error handling
+thiserror = "1.0.50"   # For error types
+serde = { version = "1.0.188", features = ["derive"] }
+serde_json = "1.0.107" # For JSON serialization
+hound = "3.5.1"        # For WAV file handling
+rayon = "1.7.1"        # For parallel processing
+log = "0.4.20"         # For logging
+env_logger = "0.10.0"  # For logging implementation
+
+[dev-dependencies]
+criterion = "0.5.1"    # For benchmarking
+tempfile = "3.8.1"     # For temporary file handling in tests
+dirs = "5.0.1"         # For accessing system directories

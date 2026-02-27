@@ -21,8 +21,10 @@ handy-keys = "0.2.0"
 hf-hub = "0.4"
 hound = "3.5.1"
 log = "0.4"
+ndarray = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+silero_vad = { package = "silero-vad-rs", path = "vendor/silero-vad-rs" }
 tauri = { version = "2.9.1", features = ["macos-private-api", "tray-icon"] }
 tauri-plugin-clipboard-manager = "2.3.2"
 tauri-plugin-log = "2.7.1"

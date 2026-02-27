@@ -4,7 +4,8 @@ export type MicPermission = "unknown" | "granted" | "denied";
 export type InputMonitoringPermission = "unknown" | "granted" | "denied";
 export type ClipboardPolicy = "restore_previous" | "keep_transcript";
 export type OutputStatus = "auto_pasted" | "paste_failed" | "copied_only";
-export type TranscriptionRuntime = "whisper" | "parakeet";
+export type TranscriptionRuntime = "whisper" | "parakeet" | "moonshine";
+export type MoonshineVariant = "tiny" | "base";
 export type ModelProfile = "fast" | "balanced" | "accurate";
 
 export interface RuntimeState {
@@ -19,6 +20,7 @@ export interface RuntimeState {
   runtime_selection: TranscriptionRuntime;
   model_profile: ModelProfile;
   parakeet_model_id: string;
+  moonshine_variant: MoonshineVariant;
 }
 
 export interface RuntimeError {

@@ -6,6 +6,7 @@ import type {
   LiveWordOutputFrame,
   ModelDownloadsSnapshot,
   ModelProfile,
+  MoonshineVariant,
   RecordMode,
   RuntimeError,
   RuntimeInitResult,
@@ -38,6 +39,9 @@ export const commands = {
 
   setParakeetModelId: (modelId: string) =>
     invoke<void>("set_parakeet_model_id", { modelId }),
+
+  setMoonshineVariant: (variant: MoonshineVariant) =>
+    invoke<void>("set_moonshine_variant", { variant }),
 
   listModelDownloads: () =>
     invoke<ModelDownloadsSnapshot>("list_model_downloads"),

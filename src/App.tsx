@@ -59,6 +59,7 @@ const initialState: RuntimeState = {
   runtime_selection: "whisper",
   model_profile: "balanced",
   parakeet_model_id: DEFAULT_PARAKEET_MODEL_ID,
+  moonshine_variant: "tiny",
 };
 
 const STARTUP_TIMEOUT_MS = 8000;
@@ -743,6 +744,22 @@ function App() {
     }
   };
 
+  const onMoonshineVariantChange = async (variant: string) => {
+    try {
+      // @ts-expect-error variant type from select element
+      await commands.setMoonshineVariant(variant);
+      const nextState = await commands.getRuntimeState();
+      setRuntimeState(nextState);
+      setRuntimeError(null);
+    } catch (error) {
+      setRuntimeError({
+        code: "set_moonshine_variant_failed",
+        message: error instanceof Error ? error.message : "Failed to update Moonshine variant.",
+        recoverable: true,
+      });
+    }
+  };
+
   const onSaveHotkeys = async () => {
     try {
       setShortcutCaptureTarget(null);
@@ -851,6 +868,10 @@ function App() {
     () => modelDownloads.models.filter((model) => model.runtime === "parakeet"),
     [modelDownloads.models],
   );
+  const moonshineModels = useMemo(
+    () => modelDownloads.models.filter((model) => model.runtime === "moonshine"),
+    [modelDownloads.models],
+  );
 
   const whisperModelByProfile = useMemo(() => {
     const modelsByProfile: Partial<Record<ModelProfile, ModelDownloadEntry>> = {};
@@ -870,6 +891,14 @@ function App() {
     return modelsById;
   }, [parakeetModels]);
 
+  const moonshineModelByVariant = useMemo(() => {
+    const modelsByVariant: Record<string, ModelDownloadEntry> = {};
+    for (const model of moonshineModels) {
+      modelsByVariant[model.profile] = model;
+    }
+    return modelsByVariant;
+  }, [moonshineModels]);
+
   const isWhisperProfileReady = (profile: ModelProfile): boolean =>
     whisperModelByProfile[profile]?.status === "ready";
 
@@ -878,6 +907,9 @@ function App() {
   const selectedParakeetModelReady =
     runtimeState.runtime_selection !== "parakeet" ||
     parakeetModelById[runtimeState.parakeet_model_id]?.status === "ready";
+  const selectedMoonshineModelReady =
+    runtimeState.runtime_selection !== "moonshine" ||
+    moonshineModelByVariant[runtimeState.moonshine_variant]?.status === "ready";
   const modelsReadyCount = modelDownloads.models.filter((model) => model.status === "ready").length;
   const modelsBadge =
     modelDownloads.active_model_key !== null
@@ -1091,10 +1123,11 @@ function App() {
               >
                 <option value="whisper">Whisper</option>
                 <option value="parakeet">Parakeet</option>
+                <option value="moonshine">Moonshine</option>
               </select>
             </label>
 
-            {runtimeState.runtime_selection === "whisper" ? (
+            {runtimeState.runtime_selection === "whisper" && (
               <>
                 <label className="field">
                   <span className="label">Model Profile</span>
@@ -1135,7 +1168,9 @@ function App() {
                   </section>
                 )}
               </>
-            ) : (
+            )}
+
+            {runtimeState.runtime_selection === "parakeet" && (
               <>
                 <label className="field">
                   <span className="label">Parakeet Model</span>
@@ -1185,6 +1220,53 @@ function App() {
               </>
             )}
 
+            {runtimeState.runtime_selection === "moonshine" && (
+              <>
+                <label className="field">
+                  <span className="label">Moonshine Variant</span>
+                  <select
+                    value={runtimeState.moonshine_variant}
+                    onChange={(event) => onMoonshineVariantChange(event.target.value)}
+                    disabled={runtimeState.phase === "transcribing" || moonshineModels.length === 0}
+                    className="select"
+                  >
+                    {moonshineModels.length === 0 ? (
+                      <option value={runtimeState.moonshine_variant} disabled>
+                        Loading model catalog...
+                      </option>
+                    ) : (
+                      moonshineModels.map((model) => {
+                        const label =
+                          model.status === "ready"
+                            ? `${model.profile.toUpperCase()} (${model.model_id})`
+                            : `${model.profile.toUpperCase()} (${model.model_id}) - download required`;
+                        return (
+                          <option key={model.key} value={model.profile}>
+                            {label}
+                          </option>
+                        );
+                      })
+                    )}
+                  </select>
+                </label>
+
+                {!selectedMoonshineModelReady && (
+                  <section className="warning-panel model-warning-callout">
+                    <p className="caption warning">
+                      Selected Moonshine variant is not downloaded yet.
+                    </p>
+                    <button
+                      className="btn secondary"
+                      type="button"
+                      onClick={() => setActiveSectionId("models")}
+                    >
+                      Open Models Section
+                    </button>
+                  </section>
+                )}
+              </>
+            )}
+
             <label className="field">
               <span className="label">Output Clipboard Policy</span>
               <select
@@ -1200,13 +1282,19 @@ function App() {
               </select>
             </label>
 
-            {runtimeState.runtime_selection === "whisper" ? (
+            {runtimeState.runtime_selection === "whisper" && (
               <p className="caption">
                 Whisper profiles require downloaded artifacts from the Models section.
               </p>
-            ) : (
+            )}
+            {runtimeState.runtime_selection === "parakeet" && (
               <p className="caption">
                 Parakeet models are downloaded and managed in the Models section.
+              </p>
+            )}
+            {runtimeState.runtime_selection === "moonshine" && (
+              <p className="caption">
+                Moonshine models are downloaded and managed in the Models section.
               </p>
             )}
           </section>

@@ -3,11 +3,12 @@ mod model_download;
 mod post_process;
 mod runtime;
 mod shortcut;
+mod vad;
 
 use model_download::{ModelDownloadManager, ModelDownloadsSnapshot};
 use runtime::{
-    ClipboardPolicy, ModelProfile, RecordMode, RuntimeController, RuntimeInitResult, RuntimeState,
-    TranscriptionResult, TranscriptionRuntime,
+    ClipboardPolicy, ModelProfile, MoonshineVariant, RecordMode, RuntimeController,
+    RuntimeInitResult, RuntimeState, TranscriptionResult, TranscriptionRuntime,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -216,6 +217,17 @@ fn list_model_downloads(
 }
 
 #[tauri::command]
+fn set_moonshine_variant(
+    app: tauri::AppHandle,
+    variant: MoonshineVariant,
+    runtime: tauri::State<'_, RuntimeController>,
+) -> Result<(), String> {
+    runtime
+        .set_moonshine_variant(&app, variant)
+        .map_err(|err| err.message)
+}
+
+#[tauri::command]
 fn start_model_download(
     app: tauri::AppHandle,
     model_key: String,
@@ -327,6 +339,7 @@ pub fn run() {
             set_runtime_selection,
             set_model_profile,
             set_parakeet_model_id,
+            set_moonshine_variant,
             list_model_downloads,
             start_model_download,
             cancel_model_download,

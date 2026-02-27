@@ -2,6 +2,7 @@ use crate::audio_capture::{write_wav_file, AudioCapture, CapturedAudio};
 use crate::model_download::is_model_ready;
 use crate::post_process::{DefaultPostProcessor, PostProcessor};
 use crate::shortcut::{FnShortcutManager, ShortcutBinding};
+use crate::vad::{LiveWordVad, LIVE_WORD_VAD_MAX_WORD_MS, LIVE_WORD_VAD_SAMPLE_RATE};
 use handy_keys::Hotkey;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -35,18 +36,6 @@ const INTERIM_EMIT_INTERVAL_MS: u64 = 1200;
 const INTERIM_TRANSCRIPTION_TIMEOUT_MS: u64 = 7000;
 const INTERIM_TIMEOUT_DISABLE_THRESHOLD: u64 = 5;
 const LIVE_WORD_TRANSCRIPTION_TIMEOUT_MS: u64 = 5000;
-const LIVE_WORD_START_MS: u64 = 75;
-const LIVE_WORD_END_SILENCE_MS: u64 = 190;
-const LIVE_WORD_MIN_MS: u64 = 90;
-const LIVE_WORD_MAX_MS: u64 = 500;
-const LIVE_WORD_PRE_PADDING_MS: u64 = 35;
-const LIVE_WORD_POST_PADDING_MS: u64 = 70;
-const LIVE_WORD_LEVEL_EMA_ALPHA: f32 = 0.08;
-const LIVE_WORD_NOISE_ADAPT_ALPHA: f32 = 0.003;
-const LIVE_WORD_NOISE_MULTIPLIER: f32 = 1.0;
-const LIVE_WORD_MIN_THRESHOLD: f32 = 0.001;
-const LIVE_WORD_MIN_RMS: f32 = 0.001;
-const LIVE_WORD_MIN_PEAK: f32 = 0.005;
 
 const DEFAULT_WHISPER_FAST_MODEL: &str = "openai/whisper-tiny";
 const DEFAULT_WHISPER_BALANCED_MODEL: &str = "openai/whisper-base";
@@ -118,6 +107,20 @@ pub enum OutputStatus {
 pub enum TranscriptionRuntime {
     Whisper,
     Parakeet,
+    Moonshine,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MoonshineVariant {
+    Tiny,
+    Base,
+}
+
+impl Default for MoonshineVariant {
+    fn default() -> Self {
+        Self::Tiny
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -141,6 +144,7 @@ pub struct RuntimeState {
     pub runtime_selection: TranscriptionRuntime,
     pub model_profile: ModelProfile,
     pub parakeet_model_id: String,
+    pub moonshine_variant: MoonshineVariant,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -194,31 +198,6 @@ pub struct LiveWordOutputFrame {
     pub emitted_at_ms: u64,
 }
 
-#[derive(Debug, Clone)]
-struct LiveWordSegmenter {
-    processed_samples: usize,
-    in_speech: bool,
-    speech_start_sample: usize,
-    speech_run_samples: usize,
-    silence_run_samples: usize,
-    level_ema: f32,
-    noise_floor: f32,
-}
-
-impl Default for LiveWordSegmenter {
-    fn default() -> Self {
-        Self {
-            processed_samples: 0,
-            in_speech: false,
-            speech_start_sample: 0,
-            speech_run_samples: 0,
-            silence_run_samples: 0,
-            level_ema: 0.0,
-            noise_floor: 0.003,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Default)]
 struct SentenceCommitState {
     committed_text: String,
@@ -236,6 +215,8 @@ struct PersistedSettings {
     model_profile: ModelProfile,
     #[serde(default = "default_parakeet_model_id")]
     parakeet_model_id: String,
+    #[serde(default)]
+    moonshine_variant: MoonshineVariant,
 }
 
 impl Default for PersistedSettings {
@@ -248,6 +229,7 @@ impl Default for PersistedSettings {
             runtime_selection: TranscriptionRuntime::Whisper,
             model_profile: ModelProfile::Balanced,
             parakeet_model_id: default_parakeet_model_id(),
+            moonshine_variant: MoonshineVariant::Tiny,
         }
     }
 }
@@ -405,7 +387,8 @@ struct RuntimeInner {
     interim_counters: InterimCounters,
     live_word_seq: u64,
     live_word_text: String,
-    live_word_segmenter: LiveWordSegmenter,
+    live_word_vad: Option<LiveWordVad>,
+    live_word_processed_samples: usize,
     sentence_commit: SentenceCommitState,
 }
 
@@ -431,6 +414,7 @@ impl RuntimeController {
                     runtime_selection: defaults.runtime_selection,
                     model_profile: defaults.model_profile,
                     parakeet_model_id: defaults.parakeet_model_id.clone(),
+                    moonshine_variant: defaults.moonshine_variant,
                 },
                 audio: AudioWorker::new(),
                 shortcut_manager: None,
@@ -444,7 +428,8 @@ impl RuntimeController {
                 interim_counters: InterimCounters::default(),
                 live_word_seq: 0,
                 live_word_text: String::new(),
-                live_word_segmenter: LiveWordSegmenter::default(),
+                live_word_vad: None,
+                live_word_processed_samples: 0,
                 sentence_commit: SentenceCommitState::default(),
             })),
         }
@@ -545,7 +530,10 @@ impl RuntimeController {
             inner.interim_stop_tx = Some(stop_tx);
             inner.live_word_seq = 0;
             inner.live_word_text.clear();
-            inner.live_word_segmenter = LiveWordSegmenter::default();
+            inner.live_word_processed_samples = 0;
+            if let Some(vad) = inner.live_word_vad.as_mut() {
+                vad.reset();
+            }
             inner.sentence_commit = SentenceCommitState::default();
         }
 
@@ -569,6 +557,7 @@ impl RuntimeController {
             runtime_selection,
             model_profile,
             parakeet_model_id,
+            moonshine_variant,
             clipboard_policy,
             mut sentence_commit,
             captured,
@@ -598,6 +587,7 @@ impl RuntimeController {
                 inner.state.runtime_selection,
                 inner.state.model_profile,
                 inner.state.parakeet_model_id.clone(),
+                inner.state.moonshine_variant,
                 inner.state.clipboard_policy,
                 inner.sentence_commit.clone(),
                 captured,
@@ -627,6 +617,7 @@ impl RuntimeController {
             runtime_selection,
             model_profile,
             parakeet_model_id.clone(),
+            moonshine_variant,
             INTERIM_TRANSCRIPTION_TIMEOUT_MS,
         ) {
             Ok(output) => output,
@@ -683,6 +674,7 @@ impl RuntimeController {
                     runtime_selection,
                     model_profile,
                     parakeet_model_id.clone(),
+                    moonshine_variant,
                     TRANSCRIPTION_TIMEOUT_MS,
                 );
 
@@ -864,10 +856,49 @@ impl RuntimeController {
                 return false;
             }
 
-            (
-                collect_live_word_candidates(&mut inner.live_word_segmenter, captured),
-                inner.live_word_text.clone(),
-            )
+            if inner.live_word_processed_samples > captured.samples.len() {
+                inner.live_word_processed_samples = 0;
+                if let Some(vad) = inner.live_word_vad.as_mut() {
+                    vad.reset();
+                }
+            }
+
+            let new_samples = &captured.samples[inner.live_word_processed_samples..];
+            inner.live_word_processed_samples = captured.samples.len();
+            let vad_input_samples = resample_for_live_word_vad(new_samples, captured.sample_rate);
+
+            let candidate_ranges: Vec<(usize, usize)> = if let Some(vad) = inner.live_word_vad.as_mut() {
+                match vad.push_samples(&vad_input_samples) {
+                    Ok(segments) => segments
+                        .into_iter()
+                        .map(|(start, end)| {
+                            (
+                                map_vad_index_to_source_sample(start, captured.sample_rate),
+                                map_vad_index_to_source_sample(end, captured.sample_rate),
+                            )
+                        })
+                        .collect(),
+                    Err(err) => {
+                        self.emit_recoverable_error(
+                            app,
+                            "live_word_vad_init_failed",
+                            format!("Live word VAD processing failed: {}", err),
+                        );
+                        inner.interim_disabled = true;
+                        return false;
+                    }
+                }
+            } else {
+                self.emit_recoverable_error(
+                    app,
+                    "live_word_vad_init_failed",
+                    "Live word VAD is not initialized for the recording session.".to_string(),
+                );
+                inner.interim_disabled = true;
+                return false;
+            };
+
+            (candidate_ranges, inner.live_word_text.clone())
         };
 
         if candidate_ranges.is_empty() {
@@ -878,15 +909,23 @@ impl RuntimeController {
             return true;
         };
 
+        let max_word_samples =
+            ((captured.sample_rate as u64 * LIVE_WORD_VAD_MAX_WORD_MS) / 1000) as usize;
+
         for (start_idx, end_idx) in candidate_ranges {
-            if end_idx <= start_idx || end_idx > captured.samples.len() {
+            if end_idx <= start_idx {
+                continue;
+            }
+            let bounded_start = start_idx.min(captured.samples.len());
+            let bounded_end = end_idx.min(captured.samples.len());
+            if bounded_end <= bounded_start {
+                continue;
+            }
+            if bounded_end - bounded_start > max_word_samples {
                 continue;
             }
 
-            let candidate_samples = &captured.samples[start_idx..end_idx];
-            if !is_likely_live_word_candidate(candidate_samples) {
-                continue;
-            }
+            let candidate_samples = &captured.samples[bounded_start..bounded_end];
 
             let candidate_audio = CapturedAudio {
                 samples: candidate_samples.to_vec(),
@@ -898,6 +937,7 @@ impl RuntimeController {
                 TranscriptionRuntime::Whisper,
                 interim_profile,
                 String::new(),
+                MoonshineVariant::Tiny,
                 LIVE_WORD_TRANSCRIPTION_TIMEOUT_MS,
             ) {
                 Ok(output) => output.text,
@@ -1036,6 +1076,20 @@ impl RuntimeController {
         {
             let mut inner = self.inner.lock().expect("runtime state mutex poisoned");
             inner.state.parakeet_model_id = normalized.to_string();
+        }
+        self.persist_settings(app)?;
+        emit_state(app, &self.current_state());
+        Ok(())
+    }
+
+    pub fn set_moonshine_variant(
+        &self,
+        app: &AppHandle,
+        variant: MoonshineVariant,
+    ) -> Result<(), RuntimeError> {
+        {
+            let mut inner = self.inner.lock().expect("runtime state mutex poisoned");
+            inner.state.moonshine_variant = variant;
         }
         self.persist_settings(app)?;
         emit_state(app, &self.current_state());
@@ -1191,8 +1245,26 @@ impl RuntimeController {
                     true,
                 ));
             }
+        }
+
+        let live_word_vad = initialize_live_word_vad(app)?;
+
+        {
+            let mut inner = self.inner.lock().expect("runtime state mutex poisoned");
+            if inner.state.phase != Phase::Idle {
+                return Err(runtime_error(
+                    "invalid_transition",
+                    format!(
+                        "Cannot start recording while phase is {:?}",
+                        inner.state.phase
+                    ),
+                    true,
+                ));
+            }
 
             inner.audio.start().map_err(map_recording_start_error)?;
+            inner.live_word_vad = Some(live_word_vad);
+            inner.live_word_processed_samples = 0;
             inner.state.phase = Phase::Recording;
             inner.active_recording_shortcut = shortcut_binding;
         }
@@ -1214,6 +1286,7 @@ impl RuntimeController {
             runtime_selection,
             model_profile,
             parakeet_model_id,
+            moonshine_variant,
             clipboard_policy,
             mut sentence_commit,
         ) = {
@@ -1240,6 +1313,7 @@ impl RuntimeController {
                 inner.state.runtime_selection,
                 inner.state.model_profile,
                 inner.state.parakeet_model_id.clone(),
+                inner.state.moonshine_variant,
                 inner.state.clipboard_policy,
                 inner.sentence_commit.clone(),
             )
@@ -1269,7 +1343,12 @@ impl RuntimeController {
         }
 
         let mut runtime_used = runtime_selection;
-        let mut model_id = resolve_model_id(runtime_selection, model_profile, &parakeet_model_id);
+        let mut model_id = resolve_model_id(
+            runtime_selection,
+            model_profile,
+            &parakeet_model_id,
+            moonshine_variant,
+        );
         let mut tail_text = String::new();
 
         if let Some(tail_audio) = tail_audio {
@@ -1280,6 +1359,7 @@ impl RuntimeController {
                     runtime_selection,
                     model_profile,
                     tail_parakeet_model_id,
+                    moonshine_variant,
                     TRANSCRIPTION_TIMEOUT_MS,
                 )
             })
@@ -1678,6 +1758,7 @@ impl RuntimeController {
             runtime_selection: inner.state.runtime_selection,
             model_profile: inner.state.model_profile,
             parakeet_model_id: inner.state.parakeet_model_id.clone(),
+            moonshine_variant: inner.state.moonshine_variant,
         }
     }
 }
@@ -1869,6 +1950,7 @@ fn transcribe_captured_audio_with_timeout(
     runtime_selection: TranscriptionRuntime,
     model_profile: ModelProfile,
     parakeet_model_id: String,
+    moonshine_variant: MoonshineVariant,
     timeout_ms: u64,
 ) -> Result<TranscriptionOutput, RuntimeError> {
     let result: Result<Result<TranscriptionOutput, RuntimeError>, ActionFailure> =
@@ -1880,6 +1962,7 @@ fn transcribe_captured_audio_with_timeout(
                     runtime_selection,
                     model_profile,
                     parakeet_model_id,
+                    moonshine_variant,
                 ))
             },
             "transcription",
@@ -1913,6 +1996,7 @@ fn transcribe_captured_audio(
     runtime_selection: TranscriptionRuntime,
     model_profile: ModelProfile,
     parakeet_model_id: String,
+    moonshine_variant: MoonshineVariant,
 ) -> Result<TranscriptionOutput, RuntimeError> {
     let min_samples = (captured.sample_rate as f32 * MIN_AUDIO_SECONDS) as usize;
     if captured.samples.len() < min_samples {
@@ -1958,14 +2042,19 @@ fn transcribe_captured_audio(
         )
     })?;
 
-    let model_id = resolve_model_id(runtime_selection, model_profile, &parakeet_model_id);
+    let model_id = resolve_model_id(
+        runtime_selection,
+        model_profile,
+        &parakeet_model_id,
+        moonshine_variant,
+    );
     let has_local_parakeet_model = runtime_selection == TranscriptionRuntime::Parakeet
         && std::path::Path::new(&model_id).is_dir();
     if !has_local_parakeet_model && !is_model_ready(&model_id) {
-        let runtime_label = if runtime_selection == TranscriptionRuntime::Whisper {
-            "Whisper"
-        } else {
-            "Parakeet"
+        let runtime_label = match runtime_selection {
+            TranscriptionRuntime::Whisper => "Whisper",
+            TranscriptionRuntime::Parakeet => "Parakeet",
+            TranscriptionRuntime::Moonshine => "Moonshine",
         };
         return Err(runtime_error(
             "model_not_ready",
@@ -2010,6 +2099,7 @@ fn map_runtime_selection(selection: TranscriptionRuntime) -> CoreRuntimeSelectio
     match selection {
         TranscriptionRuntime::Whisper => CoreRuntimeSelection::Whisper,
         TranscriptionRuntime::Parakeet => CoreRuntimeSelection::Parakeet,
+        TranscriptionRuntime::Moonshine => CoreRuntimeSelection::Moonshine,
     }
 }
 
@@ -2017,8 +2107,13 @@ fn resolve_model_id(
     selection: TranscriptionRuntime,
     profile: ModelProfile,
     parakeet_model_id: &str,
+    moonshine_variant: MoonshineVariant,
 ) -> String {
     match selection {
+        TranscriptionRuntime::Moonshine => match moonshine_variant {
+            MoonshineVariant::Tiny => "moonshine-tiny".to_string(),
+            MoonshineVariant::Base => "moonshine-base".to_string(),
+        },
         TranscriptionRuntime::Parakeet => {
             let normalized = parakeet_model_id.trim();
             if normalized.is_empty() {
@@ -2112,7 +2207,12 @@ fn resolve_live_word_profile(fallback_profile: ModelProfile) -> Option<ModelProf
         return Some(ModelProfile::Fast);
     }
 
-    let fallback_model_id = resolve_model_id(TranscriptionRuntime::Whisper, fallback_profile, "");
+    let fallback_model_id = resolve_model_id(
+        TranscriptionRuntime::Whisper,
+        fallback_profile,
+        "",
+        MoonshineVariant::Tiny,
+    );
     if is_model_ready(&fallback_model_id) {
         return Some(fallback_profile);
     }
@@ -2128,146 +2228,108 @@ fn resolve_live_word_profile(fallback_profile: ModelProfile) -> Option<ModelProf
     None
 }
 
-fn collect_live_word_candidates(
-    segmenter: &mut LiveWordSegmenter,
-    captured: &CapturedAudio,
-) -> Vec<(usize, usize)> {
-    let total_samples = captured.samples.len();
-    if segmenter.processed_samples > total_samples {
-        *segmenter = LiveWordSegmenter::default();
+fn resample_for_live_word_vad(samples: &[f32], source_rate: u32) -> Vec<f32> {
+    if samples.is_empty() {
+        return Vec::new();
     }
-    if segmenter.processed_samples == total_samples {
+    if source_rate == LIVE_WORD_VAD_SAMPLE_RATE {
+        return samples.to_vec();
+    }
+    if samples.len() == 1 {
+        return vec![samples[0]];
+    }
+
+    let target_len = ((samples.len() as u64 * LIVE_WORD_VAD_SAMPLE_RATE as u64)
+        / source_rate.max(1) as u64) as usize;
+    if target_len == 0 {
         return Vec::new();
     }
 
-    let sample_rate = captured.sample_rate.max(1);
-    let start_samples = ms_to_samples(sample_rate, LIVE_WORD_START_MS).max(1);
-    let silence_samples = ms_to_samples(sample_rate, LIVE_WORD_END_SILENCE_MS).max(1);
-    let max_word_samples = ms_to_samples(sample_rate, LIVE_WORD_MAX_MS).max(1);
+    let ratio = source_rate as f64 / LIVE_WORD_VAD_SAMPLE_RATE as f64;
+    let mut out = Vec::with_capacity(target_len);
+    for idx in 0..target_len {
+        let src_pos = (idx as f64) * ratio;
+        let left = src_pos.floor() as usize;
+        let frac = (src_pos - left as f64) as f32;
 
-    let mut candidates = Vec::new();
-    for (offset, sample) in captured.samples[segmenter.processed_samples..]
-        .iter()
-        .enumerate()
+        let left_sample = samples[left.min(samples.len() - 1)];
+        let right_sample = samples[(left + 1).min(samples.len() - 1)];
+        out.push(left_sample + (right_sample - left_sample) * frac);
+    }
+
+    out
+}
+
+fn map_vad_index_to_source_sample(vad_index: usize, source_rate: u32) -> usize {
+    ((vad_index as u64 * source_rate.max(1) as u64) / LIVE_WORD_VAD_SAMPLE_RATE as u64) as usize
+}
+
+fn initialize_live_word_vad(app: &AppHandle) -> Result<LiveWordVad, RuntimeError> {
+    let model_path = resolve_live_word_model_path(app)?;
+    if model_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| !ext.eq_ignore_ascii_case("onnx"))
+        .unwrap_or(true)
     {
-        let global_end = segmenter.processed_samples + offset + 1;
-        let amplitude = sample.abs();
-
-        segmenter.level_ema = (1.0 - LIVE_WORD_LEVEL_EMA_ALPHA) * segmenter.level_ema
-            + LIVE_WORD_LEVEL_EMA_ALPHA * amplitude;
-
-        if !segmenter.in_speech {
-            segmenter.noise_floor = (1.0 - LIVE_WORD_NOISE_ADAPT_ALPHA) * segmenter.noise_floor
-                + LIVE_WORD_NOISE_ADAPT_ALPHA * segmenter.level_ema;
-        }
-
-        let threshold =
-            (segmenter.noise_floor * LIVE_WORD_NOISE_MULTIPLIER).max(LIVE_WORD_MIN_THRESHOLD);
-        let is_speech = segmenter.level_ema >= threshold;
-
-        if segmenter.in_speech {
-            if is_speech {
-                segmenter.silence_run_samples = 0;
-            } else {
-                segmenter.silence_run_samples += 1;
-            }
-
-            let speech_span = global_end.saturating_sub(segmenter.speech_start_sample);
-            let reached_silence_boundary = segmenter.silence_run_samples >= silence_samples;
-            let reached_max_duration = speech_span >= max_word_samples;
-
-            if reached_silence_boundary || reached_max_duration {
-                let speech_end = if reached_silence_boundary {
-                    global_end.saturating_sub(segmenter.silence_run_samples)
-                } else {
-                    global_end
-                };
-
-                if let Some(candidate) = finalize_live_word_candidate(
-                    segmenter.speech_start_sample,
-                    speech_end,
-                    total_samples,
-                    sample_rate,
-                ) {
-                    candidates.push(candidate);
-                }
-
-                segmenter.in_speech = false;
-                segmenter.speech_run_samples = 0;
-                segmenter.silence_run_samples = 0;
-            }
-
-            continue;
-        }
-
-        if is_speech {
-            segmenter.speech_run_samples += 1;
-        } else {
-            segmenter.speech_run_samples = 0;
-        }
-
-        if segmenter.speech_run_samples >= start_samples {
-            segmenter.in_speech = true;
-            segmenter.speech_start_sample = global_end.saturating_sub(segmenter.speech_run_samples);
-            segmenter.speech_run_samples = 0;
-            segmenter.silence_run_samples = 0;
-        }
+        return Err(runtime_error(
+            "live_word_model_invalid",
+            format!(
+                "Silero VAD model must be an .onnx file: {}",
+                model_path.display()
+            ),
+            true,
+        ));
     }
 
-    segmenter.processed_samples = total_samples;
+    LiveWordVad::new(&model_path).map_err(map_live_word_vad_init_error)
+}
+
+fn resolve_live_word_model_path(app: &AppHandle) -> Result<PathBuf, RuntimeError> {
+    let mut candidates = Vec::new();
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        candidates.push(resource_dir.join("silero_vad.onnx"));
+        candidates.push(resource_dir.join("assets/models/silero_vad.onnx"));
+    }
+
+    let cwd = std::env::current_dir().map_err(|e| {
+        runtime_error(
+            "live_word_model_missing",
+            format!(
+                "Failed to resolve current directory for model lookup: {}",
+                e
+            ),
+            true,
+        )
+    })?;
+    candidates.push(cwd.join("assets/models/silero_vad.onnx"));
+    candidates.push(cwd.join("../assets/models/silero_vad.onnx"));
     candidates
+        .push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../assets/models/silero_vad.onnx"));
+
+    if let Some(path) = candidates.into_iter().find(|candidate| candidate.exists()) {
+        return Ok(path);
+    }
+
+    Err(runtime_error(
+        "live_word_model_missing",
+        "Silero VAD model missing. Expected assets/models/silero_vad.onnx.".to_string(),
+        true,
+    ))
 }
 
-fn finalize_live_word_candidate(
-    speech_start: usize,
-    speech_end: usize,
-    total_samples: usize,
-    sample_rate: u32,
-) -> Option<(usize, usize)> {
-    if speech_end <= speech_start {
-        return None;
-    }
-
-    let speech_len = speech_end - speech_start;
-    let min_samples = ms_to_samples(sample_rate, LIVE_WORD_MIN_MS).max(1);
-    if speech_len < min_samples {
-        return None;
-    }
-
-    let pre_padding = ms_to_samples(sample_rate, LIVE_WORD_PRE_PADDING_MS);
-    let post_padding = ms_to_samples(sample_rate, LIVE_WORD_POST_PADDING_MS);
-
-    let start_idx = speech_start.saturating_sub(pre_padding);
-    let end_idx = speech_end.saturating_add(post_padding).min(total_samples);
-
-    if end_idx <= start_idx {
-        None
-    } else {
-        Some((start_idx, end_idx))
-    }
-}
-
-fn ms_to_samples(sample_rate: u32, ms: u64) -> usize {
-    ((sample_rate as u64 * ms) / 1000) as usize
-}
-
-fn is_likely_live_word_candidate(samples: &[f32]) -> bool {
-    if samples.is_empty() {
-        return false;
-    }
-
-    let mut peak = 0.0_f32;
-    let mut power_sum = 0.0_f32;
-    for sample in samples {
-        let abs = sample.abs();
-        if abs > peak {
-            peak = abs;
+fn map_live_word_vad_init_error(err: silero_vad::Error) -> RuntimeError {
+    let code = match err {
+        silero_vad::Error::ModelLoad(_) | silero_vad::Error::InvalidInput(_) => {
+            "live_word_model_invalid"
         }
-        power_sum += sample * sample;
-    }
-
-    let rms = (power_sum / samples.len() as f32).sqrt();
-    rms >= LIVE_WORD_MIN_RMS && peak >= LIVE_WORD_MIN_PEAK
+        _ => "live_word_vad_init_failed",
+    };
+    runtime_error(
+        code,
+        format!("Failed to initialize live word VAD: {}", err),
+        true,
+    )
 }
 
 fn append_live_word_text(target: &mut String, candidate: &str) {
@@ -2295,7 +2357,8 @@ fn stop_interim_stream_locked(inner: &mut RuntimeInner) {
     inner.interim_disabled = false;
     inner.live_word_seq = 0;
     inner.live_word_text.clear();
-    inner.live_word_segmenter = LiveWordSegmenter::default();
+    inner.live_word_processed_samples = 0;
+    inner.live_word_vad = None;
 }
 
 fn ensure_temp_dir() -> std::io::Result<PathBuf> {
@@ -2691,15 +2754,30 @@ mod tests {
     #[test]
     fn model_profile_maps_to_whisper_defaults() {
         assert_eq!(
-            resolve_model_id(TranscriptionRuntime::Whisper, ModelProfile::Fast, ""),
+            resolve_model_id(
+                TranscriptionRuntime::Whisper,
+                ModelProfile::Fast,
+                "",
+                MoonshineVariant::Tiny
+            ),
             DEFAULT_WHISPER_FAST_MODEL
         );
         assert_eq!(
-            resolve_model_id(TranscriptionRuntime::Whisper, ModelProfile::Balanced, ""),
+            resolve_model_id(
+                TranscriptionRuntime::Whisper,
+                ModelProfile::Balanced,
+                "",
+                MoonshineVariant::Tiny
+            ),
             DEFAULT_WHISPER_BALANCED_MODEL
         );
         assert_eq!(
-            resolve_model_id(TranscriptionRuntime::Whisper, ModelProfile::Accurate, ""),
+            resolve_model_id(
+                TranscriptionRuntime::Whisper,
+                ModelProfile::Accurate,
+                "",
+                MoonshineVariant::Tiny
+            ),
             DEFAULT_WHISPER_ACCURATE_MODEL
         );
     }
@@ -2711,6 +2789,7 @@ mod tests {
                 TranscriptionRuntime::Parakeet,
                 ModelProfile::Fast,
                 "istupakov/parakeet-tdt-0.6b-v2-onnx",
+                MoonshineVariant::Tiny,
             ),
             "istupakov/parakeet-tdt-0.6b-v2-onnx"
         );
@@ -2719,7 +2798,12 @@ mod tests {
     #[test]
     fn parakeet_runtime_falls_back_to_core_default_model() {
         assert_eq!(
-            resolve_model_id(TranscriptionRuntime::Parakeet, ModelProfile::Fast, ""),
+            resolve_model_id(
+                TranscriptionRuntime::Parakeet,
+                ModelProfile::Fast,
+                "",
+                MoonshineVariant::Tiny
+            ),
             DEFAULT_PARAKEET_MODEL
         );
     }
@@ -2731,5 +2815,34 @@ mod tests {
             runtime.current_state().parakeet_model_id,
             DEFAULT_PARAKEET_ONNX_MODEL
         );
+    }
+
+    #[test]
+    fn live_word_vad_invalid_input_maps_to_model_invalid_code() {
+        let err = map_live_word_vad_init_error(silero_vad::Error::InvalidInput(
+            "invalid model".to_string(),
+        ));
+        assert_eq!(err.code, "live_word_model_invalid");
+    }
+
+    #[test]
+    fn live_word_vad_audio_processing_maps_to_init_failed_code() {
+        let err = map_live_word_vad_init_error(silero_vad::Error::AudioProcessing(
+            "runtime failure".to_string(),
+        ));
+        assert_eq!(err.code, "live_word_vad_init_failed");
+    }
+
+    #[test]
+    fn live_word_resampler_noop_for_16khz() {
+        let source = vec![0.1_f32, -0.2, 0.3, -0.4];
+        let out = resample_for_live_word_vad(&source, 16_000);
+        assert_eq!(out, source);
+    }
+
+    #[test]
+    fn live_word_index_mapping_scales_by_sample_rate() {
+        assert_eq!(map_vad_index_to_source_sample(16_000, 48_000), 48_000);
+        assert_eq!(map_vad_index_to_source_sample(8_000, 8_000), 4_000);
     }
 }

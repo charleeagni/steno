@@ -13,6 +13,7 @@ use transcriber_core::transcriber::DEFAULT_PARAKEET_MODEL;
 const MODEL_DOWNLOAD_EVENT: &str = "steno://model-download-state-changed";
 const MODEL_REVISION: &str = "main";
 const PROGRESS_EMIT_THROTTLE_MS: u64 = 200;
+const USEFUL_SENSORS_MOONSHINE_REPO: &str = "UsefulSensors/moonshine";
 const PARAKEET_DEFAULT_ONNX_REPO: &str = "istupakov/parakeet-tdt-0.6b-v3-onnx";
 const REQUIRED_WHISPER_MODEL_FILES: [&str; 3] =
     ["config.json", "tokenizer.json", "model.safetensors"];
@@ -28,17 +29,19 @@ struct ModelCatalogSpec {
     runtime: &'static str,
     profile: &'static str,
     model_id: &'static str,
+    repo_id: &'static str,
     required_files: &'static [&'static str],
 }
 
 // Keep model catalog centralized.
 
-const MODEL_CATALOG: [ModelCatalogSpec; 5] = [
+const MODEL_CATALOG: [ModelCatalogSpec; 7] = [
     ModelCatalogSpec {
         key: "whisper-fast",
         runtime: "whisper",
         profile: "fast",
         model_id: "openai/whisper-tiny",
+        repo_id: "openai/whisper-tiny",
         required_files: &REQUIRED_WHISPER_MODEL_FILES,
     },
     ModelCatalogSpec {
@@ -46,6 +49,7 @@ const MODEL_CATALOG: [ModelCatalogSpec; 5] = [
         runtime: "whisper",
         profile: "balanced",
         model_id: "openai/whisper-base",
+        repo_id: "openai/whisper-base",
         required_files: &REQUIRED_WHISPER_MODEL_FILES,
     },
     ModelCatalogSpec {
@@ -53,6 +57,7 @@ const MODEL_CATALOG: [ModelCatalogSpec; 5] = [
         runtime: "whisper",
         profile: "accurate",
         model_id: "openai/whisper-small",
+        repo_id: "openai/whisper-small",
         required_files: &REQUIRED_WHISPER_MODEL_FILES,
     },
     ModelCatalogSpec {
@@ -60,6 +65,7 @@ const MODEL_CATALOG: [ModelCatalogSpec; 5] = [
         runtime: "parakeet",
         profile: "v3",
         model_id: PARAKEET_DEFAULT_ONNX_REPO,
+        repo_id: PARAKEET_DEFAULT_ONNX_REPO,
         required_files: &REQUIRED_PARAKEET_MODEL_FILES,
     },
     ModelCatalogSpec {
@@ -67,7 +73,32 @@ const MODEL_CATALOG: [ModelCatalogSpec; 5] = [
         runtime: "parakeet",
         profile: "v2",
         model_id: "istupakov/parakeet-tdt-0.6b-v2-onnx",
+        repo_id: "istupakov/parakeet-tdt-0.6b-v2-onnx",
         required_files: &REQUIRED_PARAKEET_MODEL_FILES,
+    },
+    ModelCatalogSpec {
+        key: "moonshine-tiny",
+        runtime: "moonshine",
+        profile: "tiny",
+        model_id: "moonshine-tiny",
+        repo_id: USEFUL_SENSORS_MOONSHINE_REPO,
+        required_files: &[
+            "onnx/merged/tiny/float/encoder_model.onnx",
+            "onnx/merged/tiny/float/decoder_model_merged.onnx",
+            "ctranslate2/tiny/tokenizer.json",
+        ],
+    },
+    ModelCatalogSpec {
+        key: "moonshine-base",
+        runtime: "moonshine",
+        profile: "base",
+        model_id: "moonshine-base",
+        repo_id: USEFUL_SENSORS_MOONSHINE_REPO,
+        required_files: &[
+            "onnx/merged/base/float/encoder_model.onnx",
+            "onnx/merged/base/float/decoder_model_merged.onnx",
+            "ctranslate2/base/tokenizer.json",
+        ],
     },
 ];
 
@@ -88,6 +119,7 @@ pub struct ModelCatalogEntry {
     pub runtime: String,
     pub profile: String,
     pub model_id: String,
+    pub repo_id: String,
     pub required_files: Vec<String>,
 }
 
@@ -133,6 +165,7 @@ impl ModelDownloadManager {
                     runtime: spec.runtime.to_string(),
                     profile: spec.profile.to_string(),
                     model_id: spec.model_id.to_string(),
+                    repo_id: spec.repo_id.to_string(),
                     required_files: spec
                         .required_files
                         .iter()
@@ -317,7 +350,7 @@ impl ModelDownloadManager {
                 return;
             }
 
-            let mut selected_job: Option<(String, String, Vec<String>)> = None;
+            let mut selected_job: Option<(String, String, String, Vec<String>)> = None;
             while let Some(next_model_key) = state.queue.pop_front() {
                 let Some(entry) = state.models.get_mut(&next_model_key) else {
                     continue;
@@ -331,16 +364,17 @@ impl ModelDownloadManager {
                 entry.updated_at_ms = current_timestamp_ms();
 
                 let model_id = entry.catalog.model_id.clone();
+                let repo_id = entry.catalog.repo_id.clone();
                 let required_files = entry.catalog.required_files.clone();
 
                 state.active_model_key = Some(next_model_key.clone());
-                selected_job = Some((next_model_key, model_id, required_files));
+                selected_job = Some((next_model_key, model_id, repo_id, required_files));
                 break;
             }
             selected_job
         };
 
-        let Some((model_key, model_id, required_files)) = next_job else {
+        let Some((model_key, _model_id, repo_id, required_files)) = next_job else {
             self.emit_state(app);
             return;
         };
@@ -352,7 +386,7 @@ impl ModelDownloadManager {
         let key_for_task = model_key.clone();
         let task_handle = tauri::async_runtime::spawn(async move {
             manager
-                .run_download_job(app_handle, key_for_task, model_id, required_files)
+                .run_download_job(app_handle, key_for_task, repo_id, required_files)
                 .await;
         });
 
@@ -368,11 +402,11 @@ impl ModelDownloadManager {
         &self,
         app: AppHandle,
         model_key: String,
-        model_id: String,
+        repo_id: String,
         required_files: Vec<String>,
     ) {
         let result = self
-            .download_required_files(&app, &model_key, &model_id, &required_files)
+            .download_required_files(&app, &model_key, &repo_id, &required_files)
             .await;
         self.finish_download(&app, &model_key, result);
     }
@@ -381,16 +415,16 @@ impl ModelDownloadManager {
         &self,
         app: &AppHandle,
         model_key: &str,
-        model_id: &str,
+        repo_id: &str,
         required_files: &[String],
     ) -> Result<(), String> {
         let api = Api::new().map_err(|err| format!("Model downloader setup failed: {}", err))?;
         let repo = api.repo(Repo::with_revision(
-            model_id.to_string(),
+            repo_id.to_string(),
             RepoType::Model,
             MODEL_REVISION.to_string(),
         ));
-        let cache_repo = cache_repo_for_model(model_id);
+        let cache_repo = cache_repo_for_model(repo_id);
 
         let mut completed_bytes = 0_u64;
         let mut known_total_bytes = 0_u64;
@@ -458,7 +492,7 @@ impl ModelDownloadManager {
                             entry.last_error = None;
                             if entry.total_bytes == 0 {
                                 entry.total_bytes = total_cached_size(
-                                    &entry.catalog.model_id,
+                                    &entry.catalog.repo_id,
                                     &entry.catalog.required_files,
                                 );
                             }
@@ -676,7 +710,7 @@ fn model_spec_for_id(model_id: &str) -> Option<&'static ModelCatalogSpec> {
 }
 
 fn is_catalog_entry_ready(spec: &ModelCatalogSpec) -> bool {
-    let cache_repo = cache_repo_for_model(spec.model_id);
+    let cache_repo = cache_repo_for_model(spec.repo_id);
     spec.required_files
         .iter()
         .all(|file_name| cache_repo.get(file_name).is_some())
@@ -695,13 +729,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalog_contains_whisper_and_parakeet_entries() {
-        assert_eq!(MODEL_CATALOG.len(), 5);
+    fn catalog_contains_whisper_and_parakeet_entries_and_moonshine() {
+        assert_eq!(MODEL_CATALOG.len(), 7);
         assert_eq!(MODEL_CATALOG[0].profile, "fast");
         assert_eq!(MODEL_CATALOG[1].profile, "balanced");
         assert_eq!(MODEL_CATALOG[2].profile, "accurate");
         assert_eq!(MODEL_CATALOG[3].runtime, "parakeet");
         assert_eq!(MODEL_CATALOG[4].runtime, "parakeet");
+        assert_eq!(MODEL_CATALOG[5].runtime, "moonshine");
+        assert_eq!(MODEL_CATALOG[6].runtime, "moonshine");
     }
 
     #[test]
