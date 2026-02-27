@@ -1,0 +1,68 @@
+classDiagram
+  class RuntimeState {
+    +phase: idle|recording|transcribing|error
+    +mode: push_to_talk|toggle
+    +shortcut_ready: boolean
+    +mic_permission: unknown|granted|denied
+    +input_monitoring_permission: unknown|granted|denied
+    +clipboard_policy: restore_previous|keep_transcript
+    +push_to_talk_shortcut: string
+    +toggle_shortcut: string
+    +runtime_selection: whisper|parakeet
+    +model_profile: fast|balanced|accurate
+  }
+
+  class RuntimeInitResult {
+    +state: RuntimeState
+    +shortcut_error: RuntimeError?
+  }
+
+  class RuntimeError {
+    +code: string
+    +message: string
+    +recoverable: boolean
+  }
+
+  class TranscriptionResult {
+    +text: string
+    +runtime_used: whisper|parakeet
+    +model_id: string
+    +duration_ms: number
+    +reliability_target_ms: number
+    +reliability_target_met: boolean
+    +copied_to_clipboard: boolean
+    +output_status: auto_pasted|paste_failed|copied_only
+    +clipboard_restored: boolean?
+  }
+
+  class InterimTranscriptionFrame {
+    +session_id: string
+    +seq: number
+    +text: string
+    +is_stable: boolean
+    +emitted_at_ms: number
+  }
+
+  class ModelDownloadEntry {
+    +key: string
+    +runtime: string
+    +profile: string
+    +model_id: string
+    +required_files: string[]
+    +status: not_downloaded|queued|downloading|ready|failed|canceled
+    +downloaded_bytes: number
+    +total_bytes: number
+    +speed_bytes_per_sec: number
+    +last_error: string?
+    +updated_at_ms: number
+  }
+
+  class ModelDownloadsSnapshot {
+    +models: ModelDownloadEntry[]
+    +queue: string[]
+    +active_model_key: string?
+  }
+
+  RuntimeInitResult --> RuntimeState
+  RuntimeInitResult --> RuntimeError
+  ModelDownloadsSnapshot --> ModelDownloadEntry

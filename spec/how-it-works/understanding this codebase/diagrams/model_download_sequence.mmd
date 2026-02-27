@@ -1,0 +1,33 @@
+sequenceDiagram
+  participant UI as Models Section (App.tsx)
+  participant Cmd as Tauri Commands
+  participant Mgr as ModelDownloadManager
+  participant Hub as hf_hub API
+  participant Cache as Local HF Cache
+  participant Bus as Event Bus
+
+  UI->>Cmd: start_model_download(model_key)
+  Cmd->>Mgr: queue model + maybe start next
+  Mgr->>Bus: emit model-download-state-changed
+  Bus-->>UI: queued/downloading status
+
+  loop For each required file
+    Mgr->>Cache: check cached artifact
+    alt Missing in cache
+      Mgr->>Hub: download_with_progress(file)
+      Hub-->>Mgr: progress callbacks
+      Mgr->>Bus: throttled progress updates (200ms)
+      Bus-->>UI: downloaded bytes + speed
+    else Present in cache
+      Mgr->>Mgr: count file as completed
+    end
+  end
+
+  alt Download succeeds and files verified
+    Mgr->>Mgr: set status = ready
+  else Download fails or canceled
+    Mgr->>Mgr: set status = failed/canceled
+  end
+
+  Mgr->>Bus: emit final snapshot
+  Bus-->>UI: refresh model cards and queue

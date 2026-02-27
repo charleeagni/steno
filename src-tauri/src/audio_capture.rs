@@ -121,6 +121,22 @@ impl AudioCapture {
             sample_rate: self.sample_rate,
         })
     }
+
+    pub fn snapshot(&self) -> Result<CapturedAudio> {
+        if self.stream.is_none() {
+            return Err(anyhow!("Audio capture is not currently recording"));
+        }
+
+        let guard = self
+            .sink
+            .lock()
+            .map_err(|_| anyhow!("Audio sample sink lock poisoned"))?;
+
+        Ok(CapturedAudio {
+            samples: guard.clone(),
+            sample_rate: self.sample_rate,
+        })
+    }
 }
 
 fn push_f32_mono(data: &[f32], channels: usize, sink: &Arc<Mutex<Vec<f32>>>) {

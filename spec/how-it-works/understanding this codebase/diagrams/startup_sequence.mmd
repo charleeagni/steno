@@ -1,0 +1,25 @@
+sequenceDiagram
+  participant User
+  participant UI as Main Window (App.tsx)
+  participant Perm as macOS Permission Plugin
+  participant Cmd as Tauri Commands (invoke)
+  participant Runtime as RuntimeController
+  participant Hotkeys as FnShortcutManager
+  participant Bus as Event Bus (steno://*)
+
+  User->>UI: Launch app
+  UI->>UI: Register listeners (state/transcription/interim/error/models)
+  UI->>Perm: Check accessibility + microphone + input monitoring
+
+  alt Any required permission missing
+    UI->>UI: Show permission remediation screen
+  else Permissions satisfied
+    UI->>Cmd: initialize_runtime()
+    Cmd->>Runtime: ensure_settings_loaded()
+    Runtime->>Runtime: normalize + persist settings
+    Runtime->>Hotkeys: initialize shortcuts with timeout
+    Runtime->>Bus: emit steno://state-changed
+    Runtime->>Bus: emit steno://model-download-state-changed
+    Bus-->>UI: deliver initial snapshots
+    UI->>UI: render Overview/Settings screens
+  end
