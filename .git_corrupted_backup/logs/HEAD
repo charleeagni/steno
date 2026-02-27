@@ -1,0 +1,4 @@
+0000000000000000000000000000000000000000 d6ce82125bf6d884904d11bbdd4e4bf7c132e52e charleeagni <charleeagni12@gmail.com> 1771843636 +0530	clone: from https://github.com/charleeagni/steno.git
+d6ce82125bf6d884904d11bbdd4e4bf7c132e52e 43a1a92d3a7c8dfe70ca9634eb3711581305b8b5 charleeagni <charleeagni12@gmail.com> 1771867340 +0530	commit: Explain recording state contract
+43a1a92d3a7c8dfe70ca9634eb3711581305b8b5 3020a9f08ceb84adf876e51ef14eb190a3fd6485 charleeagni <charleeagni12@gmail.com> 1771867755 +0530	commit: Enable tray toggle on left click
+3020a9f08ceb84adf876e51ef14eb190a3fd6485 7e679e79d55c184b9eb31682603840a1f8e8d362 charleeagni <charleeagni12@gmail.com> 1771882549 +0530	commit: Use different port for tauri dev

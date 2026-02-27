@@ -1,0 +1,54 @@
+sequenceDiagram
+  participant Trigger as Manual Button / Global Hotkey
+  participant Runtime as RuntimeController
+  participant Audio as AudioWorker
+  participant Interim as Interim Stream Thread
+  participant Core as transcriber-core
+  participant Post as DefaultPostProcessor
+  participant OS as Clipboard + System Events
+  participant Bus as Event Bus
+  participant UI as Main Window
+  participant Overlay as Overlay Window
+
+  Trigger->>Runtime: start_recording(...)
+  Runtime->>Audio: start()
+  Runtime->>Runtime: phase = recording
+  Runtime->>Interim: start_interim_stream()
+  Runtime->>Bus: emit state-changed(recording)
+  Bus-->>UI: recording state
+  Bus-->>Overlay: show recording indicator
+
+  loop Every 1200ms while recording
+    Interim->>Audio: snapshot()
+    Interim->>Core: transcribe partial audio (timeout 7000ms)
+    Core-->>Interim: interim text
+    Interim->>Bus: emit interim-transcription frame
+    Bus-->>UI: update live preview
+  end
+
+  Trigger->>Runtime: stop_recording_and_transcribe(...)
+  Runtime->>Audio: stop()
+  Runtime->>Runtime: phase = transcribing
+  Runtime->>Bus: emit state-changed(transcribing)
+  Runtime->>Core: transcribe full capture (timeout 90000ms)
+  Core-->>Runtime: transcript + model metadata
+  Runtime->>Post: clean trailing artifacts
+  Post-->>Runtime: final text
+
+  Runtime->>OS: capture focus anchor + clipboard snapshot (optional)
+  Runtime->>OS: write transcript to clipboard
+
+  alt Focus unchanged
+    Runtime->>OS: trigger Cmd+V via osascript
+  else Focus drift or focus check failed
+    Runtime->>Runtime: skip paste for safety
+  end
+
+  opt Clipboard policy = restore_previous
+    Runtime->>OS: restore previous clipboard text
+  end
+
+  Runtime->>Runtime: phase = idle
+  Runtime->>Bus: emit transcription-complete + state-changed(idle)
+  Bus-->>UI: render final transcript + metadata
+  Bus-->>Overlay: hide overlay
