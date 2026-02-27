@@ -1,55 +1,85 @@
 # Steno
-Lean Handy-style local transcriber for macOS.
+Local, macOS-first dictation app built with Tauri, React, and Rust.
 
-## What v1 does
-- Uses `rust-transcriber` (Whisper path) via path dependency.
-- Global `Fn` hotkey support only.
-- Two record modes:
-- `push_to_talk`: hold `Fn` to record, release to transcribe.
-- `toggle`: press `Fn` once to start, again to stop/transcribe.
-- Copies transcript to clipboard and shows it in the app UI.
-- Includes manual start/stop button wired to the same backend flow.
+Steno records audio from a global shortcut, transcribes locally, and inserts text into the active app.
 
-## What v1 does not do
-- No Parakeet runtime path.
-- No auto-paste into active app.
-- No persistent recording/transcript history.
-- No non-macOS support.
-- No fallback shortcut key if `Fn` capture fails.
+## Current Scope
+- macOS only.
+- Local transcription runtimes:
+  - `whisper` (downloaded model artifacts managed in-app)
+  - `parakeet` (Rust runtime with downloadable ONNX model variants)
+- Two recording modes:
+  - `push_to_talk` (`Fn` by default)
+  - `toggle` (`Shift+Fn` by default)
+- Background tray app behavior (close hides window, app keeps running).
+- No persistent transcript history.
 
-## Run
-1. Install dependencies:
+## Tech Stack
+- Frontend: React + TypeScript + Vite (`src/`)
+- Desktop shell: Tauri v2 (`src-tauri/`)
+- Transcription core: `transcriber-core` path dependency (Rust)
+
+## Prerequisites
+- macOS
+- Node.js + npm
+- Rust toolchain (`rustup`, `cargo`)
+- Xcode Command Line Tools
+- Local `rust-transcriber` checkout available at:
+  - `../../rust-transcriber/crates/transcriber-core`
+  - This path is required by `src-tauri/Cargo.toml`
+
+## Quick Start
 ```bash
 npm install
-```
-2. Run the app:
-```bash
 npm run tauri dev
 ```
 
-## Build checks
+On first run, grant permissions when prompted:
+- Microphone
+- Accessibility
+- Input Monitoring
+
+## Build
+Frontend-only build:
 ```bash
 npm run build
-cargo check --manifest-path src-tauri/Cargo.toml
-cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
-## Permission model
-- On startup, UI checks microphone permission (`tauri-plugin-macos-permissions-api`).
-- If missing, user is prompted to grant microphone access.
-- Runtime then initializes global `Fn` capture.
-- If `Fn` shortcut initialization fails, app shows guidance for Input Monitoring / Accessibility and blocks further usage.
+Desktop app build:
+```bash
+npm run tauri build
+```
 
-## Backend flow
-- `Fn` or manual button triggers runtime state machine:
-- `Idle -> Recording -> Transcribing -> Idle/Error`
-- Audio is recorded on demand and written to a temp WAV file.
-- Transcription uses:
-- `transcriber_core::transcribe_file(input_path, output_path, model_id)`
-- Output is post-processed through a no-op interface (future LLM hook), then copied to clipboard.
+Expected output locations:
+- App bundle: `src-tauri/target/release/bundle/macos/`
+- Installer artifacts (for distribution): `src-tauri/target/release/bundle/dmg/`
 
-## Key files
-- `/Users/karthik/Desktop/merge_conflicts/Personal Automation/steno/src-tauri/src/runtime.rs`
-- `/Users/karthik/Desktop/merge_conflicts/Personal Automation/steno/src-tauri/src/shortcut.rs`
-- `/Users/karthik/Desktop/merge_conflicts/Personal Automation/steno/src-tauri/src/audio_capture.rs`
-- `/Users/karthik/Desktop/merge_conflicts/Personal Automation/steno/src/App.tsx`
+## macOS Release Plan (Downloadable Build)
+For a user-downloadable build, use this baseline flow:
+
+1. Bump versions consistently:
+   - `package.json` (`version`)
+   - `src-tauri/tauri.conf.json` (`version`)
+   - `src-tauri/Cargo.toml` (`version`)
+2. Build release artifacts:
+   - `npm run tauri build`
+3. Sign and notarize artifacts (required to avoid Gatekeeper friction).
+4. Publish `.dmg` in a release channel (for example GitHub Releases).
+5. Include first-run permission instructions in release notes.
+
+## Runtime and Permissions
+- If Input Monitoring is denied, global shortcut capture is disabled.
+- Manual recording controls remain available without Input Monitoring.
+- Accessibility is required for reliable shortcut and output behavior.
+- Clipboard policy supports:
+  - restore previous clipboard
+  - keep transcript in clipboard
+
+## Repository Map
+- `src/App.tsx`: main UI and startup orchestration.
+- `src/OverlayApp.tsx`: recording overlay window.
+- `src/tauri.ts`: typed command/event bridge.
+- `src-tauri/src/lib.rs`: Tauri shell, tray behavior, command registration.
+- `src-tauri/src/runtime.rs`: runtime state machine and transcription/output flow.
+- `src-tauri/src/model_download.rs`: model download queue/state for Whisper and Parakeet.
+- `spec/how-it-works/understanding this codebase/README.md`: deep technical walkthrough.
