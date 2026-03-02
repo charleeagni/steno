@@ -1,17 +1,20 @@
-use ndarray::Array1;
-use silero_vad::SileroVAD;
-use std::path::Path;
+use thiserror::Error;
+use webrtc_vad::{SampleRate, Vad, VadMode};
 
-pub const LIVE_WORD_VAD_THRESHOLD: f32 = 0.5;
 pub const LIVE_WORD_VAD_SAMPLE_RATE: u32 = 16_000;
-pub const LIVE_WORD_VAD_MIN_SILENCE_MS: u64 = 150;
+pub const LIVE_WORD_VAD_MIN_SILENCE_MS: u64 = 90;
 pub const LIVE_WORD_VAD_SPEECH_PAD_MS: u64 = 30;
-pub const LIVE_WORD_VAD_MIN_SPEECH_MS: u64 = 80;
-pub const LIVE_WORD_VAD_CHUNK_SIZE: usize = 512;
-pub const LIVE_WORD_VAD_MAX_WORD_MS: u64 = 500;
+pub const LIVE_WORD_VAD_MIN_SPEECH_MS: u64 = 40;
+pub const LIVE_WORD_VAD_CHUNK_SIZE: usize = 160;
+pub const LIVE_WORD_VAD_MAX_WORD_MS: u64 = 1200;
+
+#[derive(Debug, Error)]
+pub enum LiveWordVadError {
+    #[error("Invalid VAD frame: {0}")]
+    InvalidFrame(String),
+}
 
 pub struct LiveWordVad {
-    model: SileroVAD,
     pending_samples: Vec<f32>,
     processed_samples: usize,
     in_speech: bool,
@@ -21,10 +24,8 @@ pub struct LiveWordVad {
 }
 
 impl LiveWordVad {
-    pub fn new(model_path: &Path) -> Result<Self, silero_vad::Error> {
-        let model = SileroVAD::new(model_path)?;
+    pub fn new() -> Result<Self, LiveWordVadError> {
         Ok(Self {
-            model,
             pending_samples: Vec::new(),
             processed_samples: 0,
             in_speech: false,
@@ -35,7 +36,8 @@ impl LiveWordVad {
     }
 
     pub fn reset(&mut self) {
-        self.model.reset_states(1);
+        // Keep detector and clear segment state.
+
         self.pending_samples.clear();
         self.processed_samples = 0;
         self.in_speech = false;
@@ -47,7 +49,11 @@ impl LiveWordVad {
     pub fn push_samples(
         &mut self,
         samples: &[f32],
-    ) -> Result<Vec<(usize, usize)>, silero_vad::Error> {
+    ) -> Result<Vec<(usize, usize)>, LiveWordVadError> {
+        // Build detector per call to keep state Send-safe.
+
+        let mut detector = build_detector();
+
         if samples.is_empty() {
             return Ok(Vec::new());
         }
@@ -66,14 +72,13 @@ impl LiveWordVad {
         let mut segments = Vec::new();
         while self.pending_samples.len().saturating_sub(consumed) >= LIVE_WORD_VAD_CHUNK_SIZE {
             let chunk_end = consumed + LIVE_WORD_VAD_CHUNK_SIZE;
-            let chunk = Array1::from_vec(self.pending_samples[consumed..chunk_end].to_vec());
-            let prob = self
-                .model
-                .process_chunk(&chunk.view(), LIVE_WORD_VAD_SAMPLE_RATE)?[0];
+            let frame = f32_frame_to_i16(&self.pending_samples[consumed..chunk_end]);
+            let is_speech = detector
+                .is_voice_segment(&frame)
+                .map_err(|_| LiveWordVadError::InvalidFrame("invalid frame size".to_string()))?;
 
             self.processed_samples += LIVE_WORD_VAD_CHUNK_SIZE;
             let global_end = self.processed_samples;
-            let is_speech = prob >= LIVE_WORD_VAD_THRESHOLD;
 
             if self.in_speech {
                 if is_speech {
@@ -138,6 +143,22 @@ fn ms_to_samples(sample_rate: u32, ms: u64) -> usize {
     ((sample_rate as u64 * ms) / 1000) as usize
 }
 
+fn f32_frame_to_i16(samples: &[f32]) -> Vec<i16> {
+    samples
+        .iter()
+        .map(|sample| {
+            let clamped = sample.clamp(-1.0, 1.0);
+            (clamped * i16::MAX as f32) as i16
+        })
+        .collect()
+}
+
+fn build_detector() -> Vad {
+    // Use moderate aggression for balanced speech filtering.
+
+    Vad::new_with_rate_and_mode(SampleRate::Rate16kHz, VadMode::Quality)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,7 +166,12 @@ mod tests {
     #[test]
     fn ms_to_samples_converts_16khz_values() {
         assert_eq!(ms_to_samples(16_000, 30), 480);
-        assert_eq!(ms_to_samples(16_000, 80), 1280);
-        assert_eq!(ms_to_samples(16_000, 150), 2400);
+        assert_eq!(ms_to_samples(16_000, 40), 640);
+        assert_eq!(ms_to_samples(16_000, 90), 1440);
+    }
+
+    #[test]
+    fn live_word_chunk_size_matches_10ms_frame_at_16khz() {
+        assert_eq!(LIVE_WORD_VAD_CHUNK_SIZE, 160);
     }
 }

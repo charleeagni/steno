@@ -1,6 +1,8 @@
 mod audio_capture;
 mod model_download;
+mod overlay_runtime;
 mod post_process;
+mod readiness;
 mod runtime;
 mod shortcut;
 mod vad;

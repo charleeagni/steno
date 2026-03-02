@@ -1,18 +1,21 @@
-use crate::audio_capture::{write_wav_file, AudioCapture, CapturedAudio};
+use crate::audio_capture::{
+    finalize_recording_wav, AudioCapture, CaptureDestinationPolicy, CaptureEngineError,
+    CapturedAudio,
+};
 use crate::model_download::is_model_ready;
+use crate::overlay_runtime::{OverlayRuntimeController, OverlayRuntimePhase};
 use crate::post_process::{DefaultPostProcessor, PostProcessor};
-use crate::shortcut::{FnShortcutManager, ShortcutBinding};
-use crate::vad::{LiveWordVad, LIVE_WORD_VAD_MAX_WORD_MS, LIVE_WORD_VAD_SAMPLE_RATE};
-use handy_keys::Hotkey;
+use crate::readiness;
+use crate::shortcut::{self, FnShortcutManager, ShortcutBinding};
+use crate::vad::{LiveWordVad, LiveWordVadError, LIVE_WORD_VAD_SAMPLE_RATE};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use std::str::FromStr;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, Position, WebviewWindow};
+use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use transcriber_core::{
     transcribe_file_with_config, transcriber::DEFAULT_PARAKEET_MODEL,
@@ -23,7 +26,6 @@ const MIN_AUDIO_SECONDS: f32 = 0.20;
 const MAX_AUDIO_SECONDS: f32 = 180.0;
 const TOGGLE_DEBOUNCE_MS: u64 = 180;
 const HOTKEY_INIT_TIMEOUT_MS: u64 = 5000;
-const OVERLAY_BOTTOM_MARGIN_PX: i32 = 120;
 const RELIABILITY_TARGET_MS: u64 = 12_000;
 const RECORDING_START_TIMEOUT_MS: u64 = 3000;
 const RECORDING_STOP_TIMEOUT_MS: u64 = 3000;
@@ -36,24 +38,16 @@ const INTERIM_EMIT_INTERVAL_MS: u64 = 1200;
 const INTERIM_TRANSCRIPTION_TIMEOUT_MS: u64 = 7000;
 const INTERIM_TIMEOUT_DISABLE_THRESHOLD: u64 = 5;
 const LIVE_WORD_TRANSCRIPTION_TIMEOUT_MS: u64 = 5000;
+const LIVE_WORD_MIN_TRANSCRIBE_MS: u64 = 80;
+const LIVE_WORD_MIN_RMS: f32 = 0.0025;
+const LIVE_WORD_MIN_PEAK: f32 = 0.012;
 
 const DEFAULT_WHISPER_FAST_MODEL: &str = "openai/whisper-tiny";
 const DEFAULT_WHISPER_BALANCED_MODEL: &str = "openai/whisper-base";
 const DEFAULT_WHISPER_ACCURATE_MODEL: &str = "openai/whisper-small";
 const DEFAULT_PARAKEET_ONNX_MODEL: &str = "istupakov/parakeet-tdt-0.6b-v3-onnx";
 
-const DEFAULT_PUSH_TO_TALK_SHORTCUT: &str = "Fn";
-const DEFAULT_TOGGLE_SHORTCUT: &str = "Shift+Fn";
 const SETTINGS_FILE_NAME: &str = "settings.json";
-const RESERVED_SHORTCUTS: [&str; 7] = [
-    "cmd+q",
-    "cmd+w",
-    "cmd+tab",
-    "cmd+space",
-    "ctrl+space",
-    "cmd+h",
-    "cmd+m",
-];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -224,8 +218,8 @@ impl Default for PersistedSettings {
         Self {
             mode: RecordMode::PushToTalk,
             clipboard_policy: ClipboardPolicy::RestorePrevious,
-            push_to_talk_shortcut: DEFAULT_PUSH_TO_TALK_SHORTCUT.to_string(),
-            toggle_shortcut: DEFAULT_TOGGLE_SHORTCUT.to_string(),
+            push_to_talk_shortcut: shortcut::DEFAULT_PUSH_TO_TALK_SHORTCUT.to_string(),
+            toggle_shortcut: shortcut::DEFAULT_TOGGLE_SHORTCUT.to_string(),
             runtime_selection: TranscriptionRuntime::Whisper,
             model_profile: ModelProfile::Balanced,
             parakeet_model_id: default_parakeet_model_id(),
@@ -462,11 +456,8 @@ impl RuntimeController {
     pub fn set_mic_permission(&self, app: &AppHandle, granted: bool) {
         {
             let mut inner = self.inner.lock().expect("runtime state mutex poisoned");
-            inner.state.mic_permission = if granted {
-                MicPermission::Granted
-            } else {
-                MicPermission::Denied
-            };
+            inner.state.mic_permission =
+                map_mic_permission(readiness::permission_state_from_granted(granted));
         }
         emit_state(app, &self.current_state());
     }
@@ -479,7 +470,9 @@ impl RuntimeController {
         if !granted {
             {
                 let mut inner = self.inner.lock().expect("runtime state mutex poisoned");
-                inner.state.input_monitoring_permission = InputMonitoringPermission::Denied;
+                inner.state.input_monitoring_permission = map_input_monitoring_permission(
+                    readiness::permission_state_from_granted(false),
+                );
                 inner.shortcut_manager = None;
                 inner.last_toggle_press = None;
                 inner.active_recording_shortcut = None;
@@ -491,9 +484,12 @@ impl RuntimeController {
 
             self.emit_recoverable_error(
                 app,
-                "input_monitoring_permission_denied",
-                "Input Monitoring permission is required for global shortcut capture. Manual controls remain available."
-                    .to_string(),
+                readiness::input_monitoring_permission_denied_issue().code,
+                format!(
+                    "{} {} Manual controls remain available.",
+                    readiness::input_monitoring_permission_denied_issue().message,
+                    readiness::input_monitoring_permission_denied_issue().guidance
+                ),
             );
             emit_state(app, &self.current_state());
             return Ok(());
@@ -501,7 +497,8 @@ impl RuntimeController {
 
         {
             let mut inner = self.inner.lock().expect("runtime state mutex poisoned");
-            inner.state.input_monitoring_permission = InputMonitoringPermission::Granted;
+            inner.state.input_monitoring_permission =
+                map_input_monitoring_permission(readiness::permission_state_from_granted(true));
         }
 
         self.reinitialize_shortcuts(app)?;
@@ -867,36 +864,37 @@ impl RuntimeController {
             inner.live_word_processed_samples = captured.samples.len();
             let vad_input_samples = resample_for_live_word_vad(new_samples, captured.sample_rate);
 
-            let candidate_ranges: Vec<(usize, usize)> = if let Some(vad) = inner.live_word_vad.as_mut() {
-                match vad.push_samples(&vad_input_samples) {
-                    Ok(segments) => segments
-                        .into_iter()
-                        .map(|(start, end)| {
-                            (
-                                map_vad_index_to_source_sample(start, captured.sample_rate),
-                                map_vad_index_to_source_sample(end, captured.sample_rate),
-                            )
-                        })
-                        .collect(),
-                    Err(err) => {
-                        self.emit_recoverable_error(
-                            app,
-                            "live_word_vad_init_failed",
-                            format!("Live word VAD processing failed: {}", err),
-                        );
-                        inner.interim_disabled = true;
-                        return false;
+            let candidate_ranges: Vec<(usize, usize)> =
+                if let Some(vad) = inner.live_word_vad.as_mut() {
+                    match vad.push_samples(&vad_input_samples) {
+                        Ok(segments) => segments
+                            .into_iter()
+                            .map(|(start, end)| {
+                                (
+                                    map_vad_index_to_source_sample(start, captured.sample_rate),
+                                    map_vad_index_to_source_sample(end, captured.sample_rate),
+                                )
+                            })
+                            .collect(),
+                        Err(err) => {
+                            self.emit_recoverable_error(
+                                app,
+                                "live_word_vad_init_failed",
+                                format!("Live word VAD processing failed: {}", err),
+                            );
+                            inner.interim_disabled = true;
+                            return false;
+                        }
                     }
-                }
-            } else {
-                self.emit_recoverable_error(
-                    app,
-                    "live_word_vad_init_failed",
-                    "Live word VAD is not initialized for the recording session.".to_string(),
-                );
-                inner.interim_disabled = true;
-                return false;
-            };
+                } else {
+                    self.emit_recoverable_error(
+                        app,
+                        "live_word_vad_init_failed",
+                        "Live word VAD is not initialized for the recording session.".to_string(),
+                    );
+                    inner.interim_disabled = true;
+                    return false;
+                };
 
             (candidate_ranges, inner.live_word_text.clone())
         };
@@ -909,8 +907,8 @@ impl RuntimeController {
             return true;
         };
 
-        let max_word_samples =
-            ((captured.sample_rate as u64 * LIVE_WORD_VAD_MAX_WORD_MS) / 1000) as usize;
+        let min_word_samples =
+            ((captured.sample_rate as u64 * LIVE_WORD_MIN_TRANSCRIBE_MS) / 1000).max(1) as usize;
 
         for (start_idx, end_idx) in candidate_ranges {
             if end_idx <= start_idx {
@@ -921,11 +919,13 @@ impl RuntimeController {
             if bounded_end <= bounded_start {
                 continue;
             }
-            if bounded_end - bounded_start > max_word_samples {
+            if bounded_end - bounded_start < min_word_samples {
                 continue;
             }
-
             let candidate_samples = &captured.samples[bounded_start..bounded_end];
+            if !is_likely_live_word_candidate(candidate_samples) {
+                continue;
+            }
 
             let candidate_audio = CapturedAudio {
                 samples: candidate_samples.to_vec(),
@@ -944,7 +944,16 @@ impl RuntimeController {
                 Err(_) => continue,
             };
 
-            append_live_word_text(&mut next_text, &candidate_text);
+            let post_processor = DefaultPostProcessor;
+            let normalized_candidate = match post_processor.process(&candidate_text) {
+                Ok(text) => text,
+                Err(_) => continue,
+            };
+            if is_low_information_live_word_text(&normalized_candidate) {
+                continue;
+            }
+
+            append_live_word_text(&mut next_text, &normalized_candidate);
         }
 
         if next_text.is_empty() {
@@ -995,12 +1004,13 @@ impl RuntimeController {
         push: String,
         toggle: String,
     ) -> Result<(), RuntimeError> {
-        let (push_shortcut, toggle_shortcut) = normalize_shortcut_bindings(&push, &toggle)?;
+        let bindings =
+            shortcut::normalize_shortcut_bindings(&push, &toggle).map_err(map_shortcut_error)?;
 
         {
             let mut inner = self.inner.lock().expect("runtime state mutex poisoned");
-            inner.state.push_to_talk_shortcut = push_shortcut;
-            inner.state.toggle_shortcut = toggle_shortcut;
+            inner.state.push_to_talk_shortcut = bindings.push_to_talk;
+            inner.state.toggle_shortcut = bindings.toggle;
         }
 
         self.persist_settings(app)?;
@@ -1227,13 +1237,10 @@ impl RuntimeController {
                 inner.state.phase = Phase::Idle;
             }
 
-            if inner.state.mic_permission == MicPermission::Denied {
-                return Err(runtime_error(
-                    "mic_permission_denied",
-                    "Microphone permission is denied. Grant permission and retry.",
-                    true,
-                ));
-            }
+            readiness::ensure_recording_start_allowed(map_readiness_permission_from_mic(
+                inner.state.mic_permission,
+            ))
+            .map_err(map_readiness_issue)?;
 
             if inner.state.phase != Phase::Idle {
                 return Err(runtime_error(
@@ -1638,13 +1645,14 @@ impl RuntimeController {
         }
 
         let mut settings = read_persisted_settings(app)?;
-        let (push_shortcut, toggle_shortcut) = normalize_shortcut_bindings(
+        let bindings = shortcut::normalize_shortcut_bindings(
             &settings.push_to_talk_shortcut,
             &settings.toggle_shortcut,
-        )?;
+        )
+        .map_err(map_shortcut_error)?;
 
-        settings.push_to_talk_shortcut = push_shortcut;
-        settings.toggle_shortcut = toggle_shortcut;
+        settings.push_to_talk_shortcut = bindings.push_to_talk;
+        settings.toggle_shortcut = bindings.toggle;
 
         {
             let mut inner = self.inner.lock().expect("runtime state mutex poisoned");
@@ -1676,30 +1684,21 @@ impl RuntimeController {
             )
         };
 
-        if input_monitoring_permission == InputMonitoringPermission::Denied {
-            return Err(runtime_error(
-                "input_monitoring_permission_denied",
-                "Input Monitoring permission is required for global shortcut capture.",
-                true,
-            ));
-        }
+        readiness::ensure_shortcut_registration_allowed(
+            map_readiness_permission_from_input_monitoring(input_monitoring_permission),
+        )
+        .map_err(map_readiness_issue)?;
 
-        let shortcut_manager = initialize_shortcuts_with_timeout(
+        let bindings = shortcut::normalize_shortcut_bindings(&push_shortcut, &toggle_shortcut)
+            .map_err(map_shortcut_error)?;
+
+        let shortcut_manager = shortcut::initialize_shortcuts_with_timeout(
             app.clone(),
             HOTKEY_INIT_TIMEOUT_MS,
-            &push_shortcut,
-            &toggle_shortcut,
+            &bindings,
+            handle_active_hotkey_event,
         )
-        .map_err(|message| {
-            runtime_error(
-                "shortcut_init_failed",
-                format!(
-                    "Global shortcut initialization failed for push-to-talk '{}' and toggle '{}'. Enable Input Monitoring / Accessibility and restart. Details: {}",
-                    push_shortcut, toggle_shortcut, message
-                ),
-                true,
-            )
-        })?;
+        .map_err(map_shortcut_error)?;
 
         let mut inner = self.inner.lock().expect("runtime state mutex poisoned");
         inner.shortcut_manager = Some(shortcut_manager);
@@ -1763,38 +1762,6 @@ impl RuntimeController {
     }
 }
 
-fn initialize_shortcuts_with_timeout(
-    app: AppHandle,
-    timeout_ms: u64,
-    push_shortcut: &str,
-    toggle_shortcut: &str,
-) -> Result<FnShortcutManager, String> {
-    let (tx, rx) = mpsc::channel();
-    let push_shortcut_owned = push_shortcut.to_string();
-    let toggle_shortcut_owned = toggle_shortcut.to_string();
-    thread::spawn(move || {
-        let result = FnShortcutManager::start(
-            app,
-            &[
-                (push_shortcut_owned, ShortcutBinding::PushToTalk),
-                (toggle_shortcut_owned, ShortcutBinding::Toggle),
-            ],
-        );
-        let _ = tx.send(result);
-    });
-
-    match rx.recv_timeout(Duration::from_millis(timeout_ms)) {
-        Ok(result) => result,
-        Err(mpsc::RecvTimeoutError::Timeout) => Err(format!(
-            "Timed out while initializing shortcuts '{}' and '{}' after {}ms",
-            push_shortcut, toggle_shortcut, timeout_ms
-        )),
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            Err("Shortcut initializer thread disconnected".to_string())
-        }
-    }
-}
-
 fn settings_path(app: &AppHandle) -> Result<PathBuf, RuntimeError> {
     let config_dir = app.path().app_config_dir().map_err(|e| {
         runtime_error(
@@ -1830,62 +1797,56 @@ fn read_persisted_settings(app: &AppHandle) -> Result<PersistedSettings, Runtime
     })
 }
 
-fn normalize_shortcut_bindings(push: &str, toggle: &str) -> Result<(String, String), RuntimeError> {
-    let push_shortcut = normalize_shortcut(push, "push-to-talk")?;
-    let toggle_shortcut = normalize_shortcut(toggle, "toggle")?;
-
-    if push_shortcut.eq_ignore_ascii_case(&toggle_shortcut) {
-        return Err(runtime_error(
-            "shortcut_conflict",
-            "Push-to-talk and toggle shortcuts must be different.",
-            true,
-        ));
+fn map_mic_permission(permission: readiness::PermissionState) -> MicPermission {
+    match permission {
+        readiness::PermissionState::Unknown => MicPermission::Unknown,
+        readiness::PermissionState::Granted => MicPermission::Granted,
+        readiness::PermissionState::Denied => MicPermission::Denied,
     }
-
-    validate_reserved_shortcut(&push_shortcut, "push-to-talk")?;
-    validate_reserved_shortcut(&toggle_shortcut, "toggle")?;
-
-    Ok((push_shortcut, toggle_shortcut))
 }
 
-fn normalize_shortcut(shortcut: &str, label: &str) -> Result<String, RuntimeError> {
-    let parsed = Hotkey::from_str(shortcut.trim()).map_err(|e| {
-        runtime_error(
-            "invalid_shortcut",
-            format!("Invalid {} shortcut '{}': {}", label, shortcut.trim(), e),
-            true,
-        )
-    })?;
-
-    if parsed.modifiers.is_empty() {
-        return Err(runtime_error(
-            "shortcut_modifier_required",
-            format!(
-                "{} shortcut '{}' must include a modifier key.",
-                label,
-                shortcut.trim()
-            ),
-            true,
-        ));
+fn map_input_monitoring_permission(
+    permission: readiness::PermissionState,
+) -> InputMonitoringPermission {
+    match permission {
+        readiness::PermissionState::Unknown => InputMonitoringPermission::Unknown,
+        readiness::PermissionState::Granted => InputMonitoringPermission::Granted,
+        readiness::PermissionState::Denied => InputMonitoringPermission::Denied,
     }
-
-    Ok(parsed.to_string())
 }
 
-fn validate_reserved_shortcut(shortcut: &str, label: &str) -> Result<(), RuntimeError> {
-    let normalized = shortcut.to_ascii_lowercase();
-    if RESERVED_SHORTCUTS.contains(&normalized.as_str()) {
-        return Err(runtime_error(
-            "reserved_shortcut",
-            format!(
-                "{} shortcut '{}' is reserved by macOS and cannot be used.",
-                label, shortcut
-            ),
-            true,
-        ));
+fn map_readiness_permission_from_mic(permission: MicPermission) -> readiness::PermissionState {
+    match permission {
+        MicPermission::Unknown => readiness::PermissionState::Unknown,
+        MicPermission::Granted => readiness::PermissionState::Granted,
+        MicPermission::Denied => readiness::PermissionState::Denied,
     }
+}
 
-    Ok(())
+fn map_readiness_permission_from_input_monitoring(
+    permission: InputMonitoringPermission,
+) -> readiness::PermissionState {
+    match permission {
+        InputMonitoringPermission::Unknown => readiness::PermissionState::Unknown,
+        InputMonitoringPermission::Granted => readiness::PermissionState::Granted,
+        InputMonitoringPermission::Denied => readiness::PermissionState::Denied,
+    }
+}
+
+fn map_readiness_issue(issue: readiness::ReadinessIssue) -> RuntimeError {
+    runtime_error(
+        issue.code,
+        format!("{} {}", issue.message, issue.guidance),
+        true,
+    )
+}
+
+fn map_shortcut_error(err: shortcut::ShortcutBackendError) -> RuntimeError {
+    runtime_error(
+        err.code.as_str(),
+        format!("{} {}", err.message, err.code.guidance()),
+        true,
+    )
 }
 
 fn map_recording_start_error(message: String) -> RuntimeError {
@@ -1916,6 +1877,23 @@ fn map_recording_stop_error(message: String) -> RuntimeError {
     }
 
     runtime_error("recording_stop_failed", message, true)
+}
+
+fn map_capture_finalize_error(err: CaptureEngineError) -> RuntimeError {
+    match err {
+        CaptureEngineError::MissingCustomPath
+        | CaptureEngineError::MissingAppDataPath
+        | CaptureEngineError::DestinationCreateFailed { .. }
+        | CaptureEngineError::DestinationNotWritable { .. } => {
+            runtime_error("output_destination_invalid", err.to_string(), true)
+        }
+        CaptureEngineError::WavCreateFailed { .. }
+        | CaptureEngineError::WavSampleWriteFailed(_)
+        | CaptureEngineError::WavFinalizeFailed(_) => {
+            runtime_error("wav_write_failed", err.to_string(), true)
+        }
+        _ => runtime_error("recording_finalize_failed", err.to_string(), true),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2019,28 +1997,17 @@ fn transcribe_captured_audio(
         ));
     }
 
-    let temp_dir = ensure_temp_dir().map_err(|e| {
-        runtime_error(
-            "temp_dir_failed",
-            format!(
-                "Could not prepare temporary directory for transcription: {}",
-                e
-            ),
-            true,
-        )
-    })?;
-
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f");
-    let input_path = temp_dir.join(format!("recording_{}.wav", timestamp));
-    let output_path = temp_dir.join(format!("transcript_{}.txt", timestamp));
-
-    write_wav_file(&input_path, &captured).map_err(|e| {
-        runtime_error(
-            "wav_write_failed",
-            format!("Failed to create temporary recording file: {}", e),
-            true,
-        )
-    })?;
+    let artifacts = finalize_recording_wav(
+        &captured,
+        &timestamp.to_string(),
+        CaptureDestinationPolicy::Temp,
+        None,
+        None,
+    )
+    .map_err(map_capture_finalize_error)?;
+    let input_path = artifacts.recording_wav_path;
+    let output_path = artifacts.transcript_output_path;
 
     let model_id = resolve_model_id(
         runtime_selection,
@@ -2264,66 +2231,45 @@ fn map_vad_index_to_source_sample(vad_index: usize, source_rate: u32) -> usize {
     ((vad_index as u64 * source_rate.max(1) as u64) / LIVE_WORD_VAD_SAMPLE_RATE as u64) as usize
 }
 
-fn initialize_live_word_vad(app: &AppHandle) -> Result<LiveWordVad, RuntimeError> {
-    let model_path = resolve_live_word_model_path(app)?;
-    if model_path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| !ext.eq_ignore_ascii_case("onnx"))
-        .unwrap_or(true)
-    {
-        return Err(runtime_error(
-            "live_word_model_invalid",
-            format!(
-                "Silero VAD model must be an .onnx file: {}",
-                model_path.display()
-            ),
-            true,
-        ));
+fn is_likely_live_word_candidate(samples: &[f32]) -> bool {
+    if samples.is_empty() {
+        return false;
     }
 
-    LiveWordVad::new(&model_path).map_err(map_live_word_vad_init_error)
-}
-
-fn resolve_live_word_model_path(app: &AppHandle) -> Result<PathBuf, RuntimeError> {
-    let mut candidates = Vec::new();
-    if let Ok(resource_dir) = app.path().resource_dir() {
-        candidates.push(resource_dir.join("silero_vad.onnx"));
-        candidates.push(resource_dir.join("assets/models/silero_vad.onnx"));
-    }
-
-    let cwd = std::env::current_dir().map_err(|e| {
-        runtime_error(
-            "live_word_model_missing",
-            format!(
-                "Failed to resolve current directory for model lookup: {}",
-                e
-            ),
-            true,
-        )
-    })?;
-    candidates.push(cwd.join("assets/models/silero_vad.onnx"));
-    candidates.push(cwd.join("../assets/models/silero_vad.onnx"));
-    candidates
-        .push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../assets/models/silero_vad.onnx"));
-
-    if let Some(path) = candidates.into_iter().find(|candidate| candidate.exists()) {
-        return Ok(path);
-    }
-
-    Err(runtime_error(
-        "live_word_model_missing",
-        "Silero VAD model missing. Expected assets/models/silero_vad.onnx.".to_string(),
-        true,
-    ))
-}
-
-fn map_live_word_vad_init_error(err: silero_vad::Error) -> RuntimeError {
-    let code = match err {
-        silero_vad::Error::ModelLoad(_) | silero_vad::Error::InvalidInput(_) => {
-            "live_word_model_invalid"
+    let mut peak = 0.0_f32;
+    let mut power_sum = 0.0_f32;
+    for sample in samples {
+        let abs = sample.abs();
+        if abs > peak {
+            peak = abs;
         }
-        _ => "live_word_vad_init_failed",
+        power_sum += sample * sample;
+    }
+
+    let rms = (power_sum / samples.len() as f32).sqrt();
+    rms >= LIVE_WORD_MIN_RMS && peak >= LIVE_WORD_MIN_PEAK
+}
+
+fn is_low_information_live_word_text(text: &str) -> bool {
+    let normalized = text.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return true;
+    }
+
+    matches!(
+        normalized.as_str(),
+        "blank audio" | "[blank_audio]" | "<blank_audio>" | "silence"
+    )
+}
+
+fn initialize_live_word_vad(app: &AppHandle) -> Result<LiveWordVad, RuntimeError> {
+    let _ = app;
+    LiveWordVad::new().map_err(map_live_word_vad_init_error)
+}
+
+fn map_live_word_vad_init_error(err: LiveWordVadError) -> RuntimeError {
+    let code = match err {
+        LiveWordVadError::InvalidFrame(_) => "live_word_vad_init_failed",
     };
     runtime_error(
         code,
@@ -2361,15 +2307,27 @@ fn stop_interim_stream_locked(inner: &mut RuntimeInner) {
     inner.live_word_vad = None;
 }
 
-fn ensure_temp_dir() -> std::io::Result<PathBuf> {
-    let dir = std::env::temp_dir().join("steno");
-    fs::create_dir_all(&dir)?;
-    Ok(dir)
-}
-
 fn emit_state(app: &AppHandle, state: &RuntimeState) {
     let _ = app.emit("steno://state-changed", state.clone());
-    sync_overlay_visibility(app, state);
+
+    // Keep readiness aggregation aligned with shared helpers.
+
+    let _readiness = readiness::evaluate_readiness(
+        map_readiness_permission_from_mic(state.mic_permission),
+        map_readiness_permission_from_input_monitoring(state.input_monitoring_permission),
+        state.shortcut_ready,
+    );
+
+    OverlayRuntimeController::default().sync_overlay_shell(app, map_overlay_phase(&state.phase));
+}
+
+fn map_overlay_phase(phase: &Phase) -> OverlayRuntimePhase {
+    match phase {
+        Phase::Idle => OverlayRuntimePhase::Idle,
+        Phase::Recording => OverlayRuntimePhase::Recording,
+        Phase::Transcribing => OverlayRuntimePhase::Processing,
+        Phase::Error => OverlayRuntimePhase::Error,
+    }
 }
 
 fn run_action_with_timeout<T, F>(
@@ -2533,127 +2491,6 @@ fn trigger_system_paste_once() -> Result<(), String> {
     }
 }
 
-fn sync_overlay_visibility(app: &AppHandle, state: &RuntimeState) {
-    let Some(overlay_window) = app.get_webview_window("overlay") else {
-        return;
-    };
-
-    match state.phase {
-        Phase::Recording | Phase::Transcribing => {
-            position_overlay_window(app, &overlay_window);
-            if let Err(e) = overlay_window.show() {
-                log::error!("event=overlay_show_failed error={}", e);
-            }
-        }
-        Phase::Idle | Phase::Error => {
-            if let Err(e) = overlay_window.hide() {
-                log::error!("event=overlay_hide_failed error={}", e);
-            }
-        }
-    }
-}
-
-fn position_overlay_window(app: &AppHandle, overlay_window: &WebviewWindow) {
-    let Ok(window_size) = overlay_window.outer_size() else {
-        return;
-    };
-
-    // Prefer the monitor containing the cursor.
-
-    let monitor_at_cursor = app.cursor_position().ok().and_then(|cursor| {
-        app.available_monitors().ok().and_then(|monitors| {
-            let contains_point = |monitor: &tauri::Monitor, use_logical_bounds: bool| {
-                let position = monitor.position();
-                let size = monitor.size();
-                let scale_factor = monitor.scale_factor().max(1.0);
-
-                let left = if use_logical_bounds {
-                    position.x as f64 / scale_factor
-                } else {
-                    position.x as f64
-                };
-                let top = if use_logical_bounds {
-                    position.y as f64 / scale_factor
-                } else {
-                    position.y as f64
-                };
-                let right = if use_logical_bounds {
-                    left + (size.width as f64 / scale_factor)
-                } else {
-                    left + size.width as f64
-                };
-                let bottom = if use_logical_bounds {
-                    top + (size.height as f64 / scale_factor)
-                } else {
-                    top + size.height as f64
-                };
-
-                cursor.x >= left && cursor.x < right && cursor.y >= top && cursor.y < bottom
-            };
-
-            let squared_distance = |monitor: &tauri::Monitor| {
-                let position = monitor.position();
-                let size = monitor.size();
-                let scale_factor = monitor.scale_factor().max(1.0);
-                let physical_center = (
-                    position.x as f64 + (size.width as f64 / 2.0),
-                    position.y as f64 + (size.height as f64 / 2.0),
-                );
-                let logical_center = (
-                    position.x as f64 / scale_factor + (size.width as f64 / scale_factor / 2.0),
-                    position.y as f64 / scale_factor + (size.height as f64 / scale_factor / 2.0),
-                );
-                let physical_distance =
-                    (cursor.x - physical_center.0).powi(2) + (cursor.y - physical_center.1).powi(2);
-                let logical_distance =
-                    (cursor.x - logical_center.0).powi(2) + (cursor.y - logical_center.1).powi(2);
-                physical_distance.min(logical_distance)
-            };
-
-            let physical_match = monitors
-                .iter()
-                .find(|monitor| contains_point(monitor, false))
-                .cloned();
-            let logical_match = monitors
-                .iter()
-                .find(|monitor| contains_point(monitor, true))
-                .cloned();
-            let nearest_match = monitors
-                .iter()
-                .min_by(|left_monitor, right_monitor| {
-                    squared_distance(left_monitor).total_cmp(&squared_distance(right_monitor))
-                })
-                .cloned();
-
-            app.monitor_from_point(cursor.x, cursor.y)
-                .ok()
-                .flatten()
-                .or(physical_match)
-                .or(logical_match)
-                .or(nearest_match)
-        })
-    });
-
-    let target_monitor = monitor_at_cursor
-        .or_else(|| overlay_window.current_monitor().ok().flatten())
-        .or_else(|| overlay_window.primary_monitor().ok().flatten());
-
-    let Some(monitor) = target_monitor else {
-        return;
-    };
-
-    let work_area = monitor.work_area();
-    let x = work_area.position.x + ((work_area.size.width as i32 - window_size.width as i32) / 2);
-    let y = (work_area.position.y + work_area.size.height as i32
-        - window_size.height as i32
-        - OVERLAY_BOTTOM_MARGIN_PX)
-        .max(work_area.position.y);
-
-    if let Err(e) = overlay_window.set_position(Position::Physical(PhysicalPosition::new(x, y))) {
-        log::error!("event=overlay_position_failed error={}", e);
-    }
-}
-
 fn emit_transcription(app: &AppHandle, result: &TranscriptionResult) {
     let _ = app.emit("steno://transcription-complete", result.clone());
 }
@@ -2721,9 +2558,10 @@ mod tests {
 
     #[test]
     fn shortcut_bindings_require_unique_values() {
-        let result = normalize_shortcut_bindings("Fn", "Fn");
+        let result = shortcut::normalize_shortcut_bindings("Fn", "Fn");
         assert!(result.is_err());
-        let err = result.expect_err("expected conflict error");
+        let backend_err = result.expect_err("expected conflict error");
+        let err = map_shortcut_error(backend_err);
         assert_eq!(err.code, "shortcut_conflict");
     }
 
@@ -2818,16 +2656,16 @@ mod tests {
     }
 
     #[test]
-    fn live_word_vad_invalid_input_maps_to_model_invalid_code() {
-        let err = map_live_word_vad_init_error(silero_vad::Error::InvalidInput(
-            "invalid model".to_string(),
+    fn live_word_vad_invalid_input_maps_to_init_failed_code() {
+        let err = map_live_word_vad_init_error(LiveWordVadError::InvalidFrame(
+            "invalid frame".to_string(),
         ));
-        assert_eq!(err.code, "live_word_model_invalid");
+        assert_eq!(err.code, "live_word_vad_init_failed");
     }
 
     #[test]
     fn live_word_vad_audio_processing_maps_to_init_failed_code() {
-        let err = map_live_word_vad_init_error(silero_vad::Error::AudioProcessing(
+        let err = map_live_word_vad_init_error(LiveWordVadError::InvalidFrame(
             "runtime failure".to_string(),
         ));
         assert_eq!(err.code, "live_word_vad_init_failed");
@@ -2844,5 +2682,12 @@ mod tests {
     fn live_word_index_mapping_scales_by_sample_rate() {
         assert_eq!(map_vad_index_to_source_sample(16_000, 48_000), 48_000);
         assert_eq!(map_vad_index_to_source_sample(8_000, 8_000), 4_000);
+    }
+
+    #[test]
+    fn low_information_live_word_text_is_filtered() {
+        assert!(is_low_information_live_word_text("blank audio"));
+        assert!(is_low_information_live_word_text(" [blank_audio] "));
+        assert!(!is_low_information_live_word_text("hello world"));
     }
 }

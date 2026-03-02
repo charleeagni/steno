@@ -32,9 +32,7 @@ Steno records audio from a global shortcut, transcribes locally, and inserts tex
 - Local `rust-transcriber` checkout available at:
   - `../../rust-transcriber/crates/transcriber-core`
   - This path is required by `src-tauri/Cargo.toml`
-- Bundled Silero VAD model file:
-  - `assets/models/silero_vad.onnx`
-  - Recording start fails if this file is missing or invalid.
+- Built-in WebRTC VAD is used for live word segmentation.
 
 ## Quick Start
 
@@ -51,7 +49,7 @@ On first run, grant permissions when prompted:
 
 Notes:
 
-- First Rust build with Silero may take longer because ONNX Runtime binaries are fetched by `ort`.
+- First Rust build fetches WebRTC VAD dependencies from crates.io.
 - If macOS linker/rpath issues appear, enable `rpath = true` for dev/release profiles in `.cargo/config.toml`.
 
 ## Build
